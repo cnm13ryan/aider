@@ -1,5 +1,7 @@
 import base64
 import os
+import signal
+import time
 import webbrowser
 from collections import defaultdict
 from dataclasses import dataclass
@@ -10,8 +12,10 @@ from pathlib import Path
 from prompt_toolkit.completion import Completer, Completion, ThreadedCompleter
 from prompt_toolkit.cursor_shapes import ModalCursorShapeConfig
 from prompt_toolkit.enums import EditingMode
+from prompt_toolkit.filters import Condition, is_searching
 from prompt_toolkit.history import FileHistory
 from prompt_toolkit.key_binding import KeyBindings
+from prompt_toolkit.keys import Keys
 from prompt_toolkit.lexers import PygmentsLexer
 from prompt_toolkit.shortcuts import CompleteStyle, PromptSession
 from prompt_toolkit.styles import Style
@@ -172,6 +176,7 @@ class AutoCompleter(Completer):
 class InputOutput:
     num_error_outputs = 0
     num_user_asks = 0
+    clipboard_watcher = None
 
     def __init__(
         self,
@@ -196,9 +201,14 @@ class InputOutput:
         llm_history_file=None,
         editingmode=EditingMode.EMACS,
         fancy_input=True,
+        file_watcher=None,
+        multiline_mode=False,
     ):
+        self.placeholder = None
+        self.interrupted = False
         self.never_prompts = set()
         self.editingmode = editingmode
+        self.multiline_mode = multiline_mode
         no_color = os.environ.get("NO_COLOR")
         if no_color is not None and no_color != "":
             pretty = False
@@ -259,6 +269,8 @@ class InputOutput:
         else:
             self.console = Console(force_terminal=False, no_color=True)  # non-pretty
 
+        self.file_watcher = file_watcher
+
     def _get_style(self):
         style_dict = {}
         if not self.pretty:
@@ -312,7 +324,7 @@ class InputOutput:
             self.tool_error(f"{filename}: {e}")
             return
 
-    def read_text(self, filename):
+    def read_text(self, filename, silent=False):
         if is_image_file(filename):
             return self.read_image(filename)
 
@@ -320,27 +332,53 @@ class InputOutput:
             with open(str(filename), "r", encoding=self.encoding) as f:
                 return f.read()
         except OSError as err:
-            self.tool_error(f"{filename}: unable to read: {err}")
+            if not silent:
+                self.tool_error(f"{filename}: unable to read: {err}")
             return
         except FileNotFoundError:
-            self.tool_error(f"{filename}: file not found error")
+            if not silent:
+                self.tool_error(f"{filename}: file not found error")
             return
         except IsADirectoryError:
-            self.tool_error(f"{filename}: is a directory")
+            if not silent:
+                self.tool_error(f"{filename}: is a directory")
             return
         except UnicodeError as e:
-            self.tool_error(f"{filename}: {e}")
-            self.tool_error("Use --encoding to set the unicode encoding.")
+            if not silent:
+                self.tool_error(f"{filename}: {e}")
+                self.tool_error("Use --encoding to set the unicode encoding.")
             return
 
-    def write_text(self, filename, content):
+    def write_text(self, filename, content, max_retries=5, initial_delay=0.1):
+        """
+        Writes content to a file, retrying with progressive backoff if the file is locked.
+
+        :param filename: Path to the file to write.
+        :param content: Content to write to the file.
+        :param max_retries: Maximum number of retries if a file lock is encountered.
+        :param initial_delay: Initial delay (in seconds) before the first retry.
+        """
         if self.dry_run:
             return
-        try:
-            with open(str(filename), "w", encoding=self.encoding) as f:
-                f.write(content)
-        except OSError as err:
-            self.tool_error(f"Unable to write file {filename}: {err}")
+
+        delay = initial_delay
+        for attempt in range(max_retries):
+            try:
+                with open(str(filename), "w", encoding=self.encoding) as f:
+                    f.write(content)
+                return  # Successfully wrote the file
+            except PermissionError as err:
+                if attempt < max_retries - 1:
+                    time.sleep(delay)
+                    delay *= 2  # Exponential backoff
+                else:
+                    self.tool_error(
+                        f"Unable to write file {filename} after {max_retries} attempts: {err}"
+                    )
+                    raise
+            except OSError as err:
+                self.tool_error(f"Unable to write file {filename}: {err}")
+                raise
 
     def rule(self):
         if self.pretty:
@@ -348,6 +386,13 @@ class InputOutput:
             self.console.rule(**style)
         else:
             print()
+
+    def interrupt_input(self):
+        if self.prompt_session and self.prompt_session.app:
+            # Store any partial input before interrupting
+            self.placeholder = self.prompt_session.app.current_buffer.text
+            self.interrupted = True
+            self.prompt_session.app.exit()
 
     def get_input(
         self,
@@ -369,6 +414,8 @@ class InputOutput:
             show = self.format_files_for_input(rel_fnames, rel_read_only_fnames)
         if edit_format:
             show += edit_format
+        if self.multiline_mode:
+            show += (" " if edit_format else "") + "multi"
         show += "> "
 
         inp = ""
@@ -387,16 +434,51 @@ class InputOutput:
             )
         )
 
+        def suspend_to_bg(event):
+            """Suspend currently running application."""
+            event.app.suspend_to_background()
+
         kb = KeyBindings()
+
+        @kb.add(Keys.ControlZ, filter=Condition(lambda: hasattr(signal, "SIGTSTP")))
+        def _(event):
+            "Suspend to background with ctrl-z"
+            suspend_to_bg(event)
 
         @kb.add("c-space")
         def _(event):
             "Ignore Ctrl when pressing space bar"
             event.current_buffer.insert_text(" ")
 
-        @kb.add("escape", "c-m", eager=True)
+        @kb.add("c-up")
         def _(event):
-            event.current_buffer.insert_text("\n")
+            "Navigate backward through history"
+            event.current_buffer.history_backward()
+
+        @kb.add("c-down")
+        def _(event):
+            "Navigate forward through history"
+            event.current_buffer.history_forward()
+
+        @kb.add("enter", eager=True, filter=~is_searching)
+        def _(event):
+            "Handle Enter key press"
+            if self.multiline_mode:
+                # In multiline mode, Enter adds a newline
+                event.current_buffer.insert_text("\n")
+            else:
+                # In normal mode, Enter submits
+                event.current_buffer.validate_and_handle()
+
+        @kb.add("escape", "enter", eager=True, filter=~is_searching)  # This is Alt+Enter
+        def _(event):
+            "Handle Alt+Enter key press"
+            if self.multiline_mode:
+                # In multiline mode, Alt+Enter submits
+                event.current_buffer.validate_and_handle()
+            else:
+                # In normal mode, Alt+Enter adds a newline
+                event.current_buffer.insert_text("\n")
 
         while True:
             if multiline_input:
@@ -404,27 +486,86 @@ class InputOutput:
 
             try:
                 if self.prompt_session:
+                    # Use placeholder if set, then clear it
+                    default = self.placeholder or ""
+                    self.placeholder = None
+
+                    self.interrupted = False
+                    if not multiline_input:
+                        if self.file_watcher:
+                            self.file_watcher.start()
+                        if self.clipboard_watcher:
+                            self.clipboard_watcher.start()
+
                     line = self.prompt_session.prompt(
                         show,
+                        default=default,
                         completer=completer_instance,
                         reserve_space_for_menu=4,
                         complete_style=CompleteStyle.MULTI_COLUMN,
                         style=style,
                         key_bindings=kb,
+                        complete_while_typing=True,
                     )
                 else:
                     line = input(show)
+
+                # Check if we were interrupted by a file change
+                if self.interrupted:
+                    line = line or ""
+                    if self.file_watcher:
+                        cmd = self.file_watcher.process_changes()
+                        return cmd
+
+            except EOFError:
+                raise
+            except Exception as err:
+                import traceback
+
+                self.tool_error(str(err))
+                self.tool_error(traceback.format_exc())
+                return ""
             except UnicodeEncodeError as err:
                 self.tool_error(str(err))
                 return ""
+            finally:
+                if self.file_watcher:
+                    self.file_watcher.stop()
+                if self.clipboard_watcher:
+                    self.clipboard_watcher.stop()
 
-            if line and line[0] == "{" and not multiline_input:
-                multiline_input = True
-                inp += line[1:] + "\n"
+            if line.strip("\r\n") and not multiline_input:
+                stripped = line.strip("\r\n")
+                if stripped == "{":
+                    multiline_input = True
+                    multiline_tag = None
+                    inp += ""
+                elif stripped[0] == "{":
+                    # Extract tag if it exists (only alphanumeric chars)
+                    tag = "".join(c for c in stripped[1:] if c.isalnum())
+                    if stripped == "{" + tag:
+                        multiline_input = True
+                        multiline_tag = tag
+                        inp += ""
+                    else:
+                        inp = line
+                        break
+                else:
+                    inp = line
+                    break
                 continue
-            elif line and line[-1] == "}" and multiline_input:
-                inp += line[:-1] + "\n"
-                break
+            elif multiline_input and line.strip():
+                if multiline_tag:
+                    # Check if line is exactly "tag}"
+                    if line.strip("\r\n") == f"{multiline_tag}}}":
+                        break
+                    else:
+                        inp += line + "\n"
+                # Check if line is exactly "}"
+                elif line.strip("\r\n") == "}":
+                    break
+                else:
+                    inp += line + "\n"
             elif multiline_input:
                 inp += line + "\n"
             else:
@@ -438,10 +579,13 @@ class InputOutput:
     def add_to_input_history(self, inp):
         if not self.input_history_file:
             return
-        FileHistory(self.input_history_file).append_string(inp)
-        # Also add to the in-memory history if it exists
-        if hasattr(self, "session") and hasattr(self.session, "history"):
-            self.session.history.append_string(inp)
+        try:
+            FileHistory(self.input_history_file).append_string(inp)
+            # Also add to the in-memory history if it exists
+            if self.prompt_session and self.prompt_session.history:
+                self.prompt_session.history.append_string(inp)
+        except OSError as err:
+            self.tool_warning(f"Unable to write to input history file: {err}")
 
     def get_input_history(self):
         if not self.input_history_file:
@@ -458,14 +602,17 @@ class InputOutput:
             log_file.write(f"{role.upper()} {timestamp}\n")
             log_file.write(content + "\n")
 
+    def display_user_input(self, inp):
+        if self.pretty and self.user_input_color:
+            style = dict(style=self.user_input_color)
+        else:
+            style = dict()
+
+        self.console.print(Text(inp), **style)
+
     def user_input(self, inp, log_only=True):
         if not log_only:
-            if self.pretty and self.user_input_color:
-                style = dict(style=self.user_input_color)
-            else:
-                style = dict()
-
-            self.console.print(Text(inp), **style)
+            self.display_user_input(inp)
 
         prefix = "####"
         if inp:
@@ -485,11 +632,11 @@ class InputOutput:
         hist = "\n" + content.strip() + "\n\n"
         self.append_chat_history(hist)
 
-    def offer_url(self, url, prompt="Open URL for more info?"):
+    def offer_url(self, url, prompt="Open URL for more info?", allow_never=True):
         """Offer to open a URL in the browser, returns True if opened."""
         if url in self.never_prompts:
             return False
-        if self.confirm_ask(prompt, subject=url, allow_never=True):
+        if self.confirm_ask(prompt, subject=url, allow_never=allow_never):
             webbrowser.open(url)
             return True
         return False
@@ -503,6 +650,9 @@ class InputOutput:
         group=None,
         allow_never=False,
     ):
+        # Temporarily disable multiline mode for yes/no prompts
+        orig_multiline = self.multiline_mode
+        self.multiline_mode = False
         self.num_user_asks += 1
 
         question_id = (question, subject)
@@ -560,6 +710,7 @@ class InputOutput:
                     res = self.prompt_session.prompt(
                         question,
                         style=style,
+                        complete_while_typing=False,
                     )
                 else:
                     res = input(question)
@@ -600,9 +751,15 @@ class InputOutput:
         hist = f"{question.strip()} {res}"
         self.append_chat_history(hist, linebreak=True, blockquote=True)
 
+        # Restore original multiline mode
+        self.multiline_mode = orig_multiline
+
         return is_yes
 
     def prompt_ask(self, question, default="", subject=None):
+        # Temporarily disable multiline mode for prompts
+        orig_multiline = self.multiline_mode
+        self.multiline_mode = False
         self.num_user_asks += 1
 
         if subject:
@@ -617,7 +774,12 @@ class InputOutput:
             res = "no"
         else:
             if self.prompt_session:
-                res = self.prompt_session.prompt(question + " ", default=default, style=style)
+                res = self.prompt_session.prompt(
+                    question + " ",
+                    default=default,
+                    style=style,
+                    complete_while_typing=True,
+                )
             else:
                 res = input(question + " ")
 
@@ -625,6 +787,9 @@ class InputOutput:
         self.append_chat_history(hist, linebreak=True, blockquote=True)
         if self.yes in (True, False):
             self.tool_output(hist)
+
+        # Restore original multiline mode
+        self.multiline_mode = orig_multiline
 
         return res
 
@@ -688,8 +853,24 @@ class InputOutput:
 
         self.console.print(show_resp)
 
+    def set_placeholder(self, placeholder):
+        """Set a one-time placeholder text for the next input prompt."""
+        self.placeholder = placeholder
+
     def print(self, message=""):
         print(message)
+
+    def toggle_multiline_mode(self):
+        """Toggle between normal and multiline input modes"""
+        self.multiline_mode = not self.multiline_mode
+        if self.multiline_mode:
+            self.tool_output(
+                "Multiline mode: Enabled. Enter inserts newline, Alt-Enter submits text"
+            )
+        else:
+            self.tool_output(
+                "Multiline mode: Disabled. Alt-Enter inserts newline, Enter submits text"
+            )
 
     def append_chat_history(self, text, linebreak=False, blockquote=False, strip=True):
         if blockquote:

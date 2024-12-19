@@ -24,8 +24,8 @@ from dotenv import load_dotenv
 from plots import plot_refactoring
 from rich.console import Console
 
-from aider import models
-from aider.coders import Coder
+from aider import models, sendchat
+from aider.coders import Coder, base_coder
 from aider.dump import dump  # noqa: F401
 from aider.io import InputOutput
 
@@ -47,10 +47,44 @@ def find_latest_benchmark_dir():
         print("Error: No benchmark directories found under tmp.benchmarks.")
         sys.exit(1)
 
-    latest_dir = max(
-        benchmark_dirs,
-        key=lambda d: next((f.stat().st_mtime for f in d.rglob("*.md") if f.is_file()), 0),
-    )
+    # Get current time and 24 hours ago
+    now = datetime.datetime.now()
+    day_ago = now - datetime.timedelta(days=1)
+
+    # Filter directories by name pattern YYYY-MM-DD-HH-MM-SS--
+    recent_dirs = []
+    for d in benchmark_dirs:
+        try:
+            # Extract datetime from directory name
+            date_str = d.name[:19]  # Takes YYYY-MM-DD-HH-MM-SS
+            dir_date = datetime.datetime.strptime(date_str, "%Y-%m-%d-%H-%M-%S")
+            if dir_date >= day_ago:
+                recent_dirs.append(d)
+        except ValueError:
+            # Skip directories that don't match the expected format
+            continue
+
+    if not recent_dirs:
+        print("Error: No benchmark directories found from the last 24 hours.")
+        sys.exit(1)
+
+    # Find directory with most recently modified .md file
+    latest_dir = None
+    latest_time = 0
+
+    for d in recent_dirs:
+        # Look for .md files in subdirectories
+        for md_file in d.glob("*/.*.md"):
+            if md_file.is_file():
+                mtime = md_file.stat().st_mtime
+                if mtime > latest_time:
+                    latest_time = mtime
+                    latest_dir = d
+
+    if not latest_dir:
+        print("Error: No .md files found in recent benchmark directories.")
+        sys.exit(1)
+
     print(f"Using the most recently updated benchmark directory: {latest_dir.name}")
     return latest_dir
 
@@ -124,6 +158,9 @@ def main(
     dirnames: Optional[List[str]] = typer.Argument(None, help="Directory names"),
     graphs: bool = typer.Option(False, "--graphs", help="Generate graphs"),
     model: str = typer.Option("gpt-3.5-turbo", "--model", "-m", help="Model name"),
+    sleep: float = typer.Option(
+        0, "--sleep", help="Sleep seconds between tests when single threaded"
+    ),
     edit_format: str = typer.Option(None, "--edit-format", "-e", help="Edit format"),
     editor_model: str = typer.Option(None, "--editor-model", help="Editor model name"),
     editor_edit_format: str = typer.Option(None, "--editor-edit-format", help="Editor edit format"),
@@ -155,6 +192,9 @@ def main(
     tries: int = typer.Option(2, "--tries", "-r", help="Number of tries for running tests"),
     threads: int = typer.Option(1, "--threads", "-t", help="Number of threads to run in parallel"),
     num_tests: int = typer.Option(-1, "--num-tests", "-n", help="Number of tests to run"),
+    num_ctx: Optional[int] = typer.Option(
+        None, "--num-ctx", help="Override model context window size"
+    ),
     exercises_dir: str = typer.Option(
         EXERCISES_DIR_DEFAULT, "--exercises-dir", help="Directory with exercise files"
     ),
@@ -230,6 +270,11 @@ def main(
     if num_tests > 0:
         test_dnames = test_dnames[:num_tests]
 
+    # Don't give up when benchmarking
+    LONG_TIMEOUT = 24 * 60 * 60
+    sendchat.RETRY_TIMEOUT = LONG_TIMEOUT
+    base_coder.RETRY_TIMEOUT = LONG_TIMEOUT
+
     if threads == 1:
         all_results = []
         for testname in test_dnames:
@@ -247,10 +292,14 @@ def main(
                 max_apply_update_errors,
                 editor_model,
                 editor_edit_format,
+                num_ctx,
+                sleep,
             )
 
             all_results.append(results)
             summarize_results(dirname)
+            if sleep:
+                time.sleep(sleep)
     else:
         run_test_threaded = lox.thread(threads)(run_test)
         for testname in test_dnames:
@@ -526,6 +575,8 @@ def run_test_real(
     max_apply_update_errors,
     editor_model,
     editor_edit_format,
+    num_ctx=None,
+    sleep=0,
 ):
     if not os.path.isdir(testdir):
         print("Not a dir:", testdir)
@@ -588,6 +639,11 @@ def run_test_real(
         editor_model=editor_model,
         editor_edit_format=editor_edit_format,
     )
+
+    if num_ctx:
+        if not main_model.extra_params:
+            main_model.extra_params = {}
+        main_model.extra_params["num_ctx"] = num_ctx
     edit_format = edit_format or main_model.edit_format
 
     dump(main_model)

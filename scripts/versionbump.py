@@ -10,15 +10,6 @@ import sys
 from packaging import version
 
 
-def check_cog_pyproject():
-    result = subprocess.run(["cog", "--check", "pyproject.toml"], capture_output=True, text=True)
-
-    if result.returncode != 0:
-        print("Error: cog --check pyproject.toml failed, updating.")
-        subprocess.run(["cog", "-r", "pyproject.toml"])
-        sys.exit(1)
-
-
 def main():
     parser = argparse.ArgumentParser(description="Bump version")
     parser.add_argument("new_version", help="New version in x.y.z format")
@@ -82,7 +73,6 @@ def main():
     dry_run = args.dry_run
 
     # Perform checks before proceeding
-    check_cog_pyproject()
     check_branch()
     check_working_directory_clean()
     check_main_branch_up_to_date()
@@ -124,7 +114,10 @@ def main():
     for cmd in git_commands:
         print(f"Running: {' '.join(cmd)}")
         if not dry_run:
-            subprocess.run(cmd, check=True)
+            subprocess.run(
+                cmd,
+                check=True,
+            )
 
     new_dev_version = f"{incremented_version}.dev"
     updated_dev_content = re.sub(
@@ -151,8 +144,8 @@ def main():
         if not dry_run:
             subprocess.run(cmd, check=True)
 
-    # Remove aider/__version__.py if it exists
-    version_file = "aider/__version__.py"
+    # Remove aider/_version.py if it exists
+    version_file = "aider/_version.py"
     if os.path.exists(version_file):
         print(f"Removing {version_file}")
         if not dry_run:
